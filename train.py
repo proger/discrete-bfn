@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 import wandb
 from flash_attn import flash_attn_func
 
+from train_diagnostics import summarize_activations, summarize_weights, summarize_gradients
+
+
 K = 27 # space is zero
 D = 16
 B1 = 0.75**2
@@ -69,10 +72,12 @@ class Net(nn.Module):
         x = self.output(x)
         return x
 
+
 def output(net, state_NDK, t_ND1):
     device = next(net.parameters()).device
     with torch.autocast('cuda', dtype=torch.bfloat16):
         return net(state_NDK.to(device), t_ND1.to(device)).softmax(dim=-1)
+
 
 def sample(output_dist):
     "sample from the categorical distributions of every token independently"
@@ -80,6 +85,7 @@ def sample(output_dist):
     cdf = output_dist.cumsum(dim=-1).roll(1, dims=(-1))
     cdf[:, :, 0] = 0
     return (cdf <= rand).sum(dim=-1) - 1
+
 
 def generate(net, B1=B1, T=10):
     device = next(net.parameters()).device
@@ -101,19 +107,19 @@ def generate(net, B1=B1, T=10):
         state[i+1] = state[i+1] / state[i+1].sum(dim=-1, keepdim=True)
 
     return state
+
  
-def loss(flow, ex_NDK, B1=B1):
-    device = next(flow.parameters()).device
+def random_loss(net, ex_NDK, B1=B1):
     N, D, K = ex_NDK.shape
-    t_ND1 = torch.rand(N, 1, 1, device=device).repeat(1, D, 1)
+    t_ND1 = ex_NDK.new_empty(N, 1, 1).uniform_().repeat(1, D, 1).clamp(1e-6, 1)
     beta_ND1 = B1 * t_ND1**2
 
     mu_NDK = beta_ND1 * (K * ex_NDK - 1)
     std_ND1 = (beta_ND1 * K + 1e-6)**0.5
-    eps_NDK = torch.randn(N, D, K, device=device)
+    eps_NDK = torch.randn_like(ex_NDK)
 
     state_NDK = (mu_NDK + std_ND1 * eps_NDK).softmax(dim=-1)
-    e_NDK = output(flow, state_NDK, t_ND1)
+    e_NDK = output(net, state_NDK, t_ND1)
 
     loss_NDK = K * B1 * t_ND1 * (ex_NDK - e_NDK).pow(2)
     return loss_NDK.sum(dim=-1).mean()
@@ -122,11 +128,17 @@ def loss(flow, ex_NDK, B1=B1):
 @torch.inference_mode()
 def test(net):
     net.eval()
-    examples, figures = [], []
+    examples, figures, extra = [], [], {}
     for step in range(5):
         states = generate(net)
         s = decode(states[-1].argmax(dim=-1).cpu())
-        examples.append((s, loss(net, states[[-1]]).item()))
+
+        with summarize_activations(net, infix=['block'], verbose=False) as log:
+            random_loss(net, states[[-1]])
+
+        extra.update(log)
+        examples.append(s)
+
         if step == 0:
             fig, axs = plt.subplots(1, len(states), figsize=(20, 3))
             for i, ax in enumerate(axs):
@@ -137,7 +149,7 @@ def test(net):
             figures.append(wandb.Image(fig))
             plt.close(fig)
     net.train()
-    return examples, {'test': figures}
+    return examples, {'test': figures, **extra}
 
 
 def make_config():
@@ -167,8 +179,6 @@ def train():
     optimizer = torch.optim.Adam(net.parameters(), lr=conf.lr)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1 - step / conf.steps)
 
-    losses = torch.zeros(conf.steps)
-    gnorms = torch.zeros(conf.steps)
     dataset = torch.stack([encode(word) for word in words]).to(device)
     
     for step in range(conf.steps):
@@ -177,24 +187,28 @@ def train():
         #batch_indices = range(conf.batch_size)
         ex_NDK = dataset[batch_indices]
         with torch.autocast('cuda', dtype=torch.bfloat16):
-            l = loss(net, ex_NDK).mean()
-            l.backward()
-        losses[step] = l.item()
-        gnorms[step] = torch.nn.utils.clip_grad_norm_(net.parameters(), 10)
+            loss = random_loss(net, ex_NDK).mean()
+            loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), 10)
         optimizer.step()
 
         lr = optimizer.param_groups[0]['lr']
 
-        examples, test_results = test(net) if step % 1000 == 0 else ('', {})
-        wandb.log({'loss': losses[step].item(), 'grad_norm': gnorms[step].item(), 'lr': lr, **test_results})
+        if step % 1000 == 0:
+            examples, log = test(net)
+            log.update(summarize_weights(net))
+            log.update(summarize_gradients(net))
+        else:
+            examples, log = '', {}
 
         if step % 100 == 0:
-            print(f'step={step}', f'loss={losses[step].item():.3f}', f'grad_norm={gnorms[step].item():.3f}', f'lr={lr:.7f}', examples)
+            print(f'step={step}', f'loss={loss.item():.3f}', f'grad_norm={grad_norm.item():.3f}', f'lr={lr:.7f}', examples)
 
+        wandb.log({'loss': loss.item(), 'grad_norm': grad_norm.item(), 'lr': lr, **log})
         scheduler.step()
 
-    examples, test_results = test(net)
-    wandb.log(test_results)
+    examples, log = test(net)
+    wandb.log(log)
     print(examples)
 
     torch.save(net.state_dict(), 'model.pt')
